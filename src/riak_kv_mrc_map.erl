@@ -138,9 +138,12 @@ process(Input, _Last,
         #state{fd=_FittingDetails, phase=Phase, arg=Arg}=State) ->
     ?T(_FittingDetails, [map], {mapping, Input}),
     case map(Phase, Arg, Input) of
-        {ok, Results} ->
+        {ok, Results} when is_list(Results) ->
             ?T(_FittingDetails, [map], {produced, Results}),
-            send_results(Results, State),
+            send_results(Results, State);
+        {ok, _NonListResults} ->
+            ?T(_FittingDetails, [map, error],
+               {error, {non_list_result, Input}}),
             {ok, State};
         {forward_preflist, Reason} ->
             ?T(_FittingDetails, [map], {forward_preflist, Reason}),
@@ -222,10 +225,16 @@ bucket_linkfun(Bucket) ->
     erlang:make_fun(Module, Function, 3).
 
 %% @doc Send results to the next fitting.
--spec send_results([term()], state()) -> ok.
-send_results(Results, #state{p=P, fd=FD}) ->
-    [ riak_pipe_vnode_worker:send_output(R, P, FD) || R <- Results],
-    ok.
+-spec send_results([term()], state()) -> {ok | {error, term()}, state()}.
+send_results([], State) ->
+    {ok, State};
+send_results([Result | Results], #state{p=P, fd=FD} = State) ->
+    case riak_pipe_vnode_worker:send_output(Result, P, FD) of
+        ok ->
+            send_results(Results, State);
+        ER ->
+            {ER, State}
+    end.
 
 %% @doc Unused.
 -spec done(state()) -> ok.

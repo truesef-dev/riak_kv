@@ -30,6 +30,8 @@
 
 -export([parse_request/1, parse_inputs/1, parse_query/1]).
 -export([jsonify_not_found/1, dejsonify_not_found/1]).
+-export([jsonify_bkeys/2]).
+-export([jsonify_pipe_error/2]).
 
 -define(QUERY_TOKEN, <<"query">>).
 -define(INPUTS_TOKEN, <<"inputs">>).
@@ -220,6 +222,8 @@ parse_index_input(Inputs) ->
             end;
         StartKey /= undefined andalso EndKey /= undefined ->
             case riak_index:parse_fields([{Index, StartKey}, {Index, EndKey}]) of
+                {ok, [{Index1, Key1}]} ->
+                    {ok, {index, Bucket, Index1, Key1}};
                 {ok, [{Index1, StartKey1}, {Index1, EndKey1}]} ->
                     {ok, {index, Bucket, Index1, StartKey1, EndKey1}};
                 {error, Reasons} ->
@@ -250,12 +254,7 @@ parse_query(Query) ->
     parse_query(Query, []).
 
 parse_query([], Accum) ->
-    if
-        length(Accum) > 0 ->
-            {ok, lists:reverse(Accum)};
-        true ->
-            {error, "No query phases were given\n"}
-    end;
+    {ok, lists:reverse(Accum)};
 parse_query([{struct, [{Type, {struct, StepDef}}]}|T], Accum)
   when Type =:= <<"map">>; Type =:= <<"reduce">>; Type =:= <<"link">> ->
     StepType = case Type of
@@ -318,6 +317,19 @@ jsonify_not_found({not_found, {Bucket, Key}, KeyData}) ->
                                     {<<"keydata">>, KeyData}]}}]};
 jsonify_not_found(Data) ->
     Data.
+
+jsonify_bkeys(Results, HasMRQuery) when HasMRQuery == true ->
+    Results;
+jsonify_bkeys(Results, HasMRQuery) when HasMRQuery == false ->
+    jsonify_bkeys_1(Results, []).
+jsonify_bkeys_1([{{B, K},D}|Rest], Acc) ->
+    jsonify_bkeys_1(Rest, [[B,K,D]|Acc]);
+jsonify_bkeys_1([{B, K}|Rest], Acc) ->
+    jsonify_bkeys_1(Rest, [[B,K]|Acc]);
+jsonify_bkeys_1([], Acc) ->
+    lists:reverse(Acc).
+
+
 
 parse_link_step(StepDef) ->
     Bucket = proplists:get_value(<<"bucket">>, StepDef, <<"_">>),
@@ -447,6 +459,77 @@ erl_phase_error(StepDef) ->
              "   - \"bucket\" and \"key\" fields,"
              " specifying a Riak object containing"
              " Erlang function source\n"]}.
+
+%% @doc Produce a list of mochjson2 props from a pipe error log
+jsonify_pipe_error(From, {Error, Input}) ->
+    %% map function returned error tuple
+    [{phase, pipe_phase_index(From)},
+     {error, trunc_print(Error)},
+     {input, trunc_print(Input)}];
+jsonify_pipe_error(_From, Elist) when is_list(Elist) ->
+    %% generic pipe fitting error
+
+    %% phase pulled from Elist should be the same as From,
+    %% but just to dig into that info more, we use Elist here
+    [{phase, pipe_error_phase(Elist)},
+     {error, pipe_error_error(Elist)},
+     {input, pipe_error_input(Elist)},
+     {type, pipe_error_type(Elist)},
+     {stack, pipe_error_stack(Elist)}];
+jsonify_pipe_error(From, Other) ->
+    %% some other error
+    [{phase, pipe_phase_index(From)},
+     {error, trunc_print(Other)}].
+
+%% @doc Turn the pipe fitting name into a MapReduce phase index.
+-spec pipe_phase_index(integer()|{term(),integer()}) -> integer().
+pipe_phase_index({_Type, I}) -> I;
+pipe_phase_index(I)          -> I.
+
+%% @doc convenience for formatting ~500chars of a term as a
+%% human-readable string
+-spec trunc_print(term()) -> binary().
+trunc_print(Term) ->
+    {Msg, _Len} = lager_trunc_io:print(Term, 500),
+    iolist_to_binary(Msg).
+
+%% @doc Pull a field out of a proplist, and possibly transform it.
+pipe_error_field(Field, Proplist) ->
+    pipe_error_field(Field, Proplist, fun(X) -> X end).
+pipe_error_field(Field, Proplist, TrueFun) ->
+    pipe_error_field(Field, Proplist, TrueFun, null).
+pipe_error_field(Field, Proplist, TrueFun, FalseVal) ->
+    case lists:keyfind(Field, 1, Proplist) of
+        {Field, Value} -> TrueFun(Value);
+        false          -> FalseVal
+    end.
+
+%% @doc Pull a field out of a proplist, and format it as a reasonably
+%% short binary if available.
+pipe_error_trunc_print(Field, Elist) ->
+    pipe_error_field(Field, Elist, fun trunc_print/1).
+
+%% @doc Determine the phase that this error came from.
+pipe_error_phase(Elist) ->
+    Details = pipe_error_field(details, Elist, fun(X) -> X end, []),
+    pipe_error_field(name, Details, fun pipe_phase_index/1).
+
+pipe_error_type(Elist) ->
+    %% is this really useful?
+    pipe_error_field(type, Elist).
+
+pipe_error_error(Elist) ->
+    pipe_error_field(error, Elist, fun trunc_print/1,
+                     pipe_error_trunc_print(reason, Elist)).
+
+pipe_error_input(Elist) ->
+    %% translate common inputs?
+    %% e.g. strip 'ok' tuple from map input
+    pipe_error_trunc_print(input, Elist).
+
+pipe_error_stack(Elist) ->
+    %% truncate stacks to "important" part?
+    pipe_error_trunc_print(stack, Elist).
 
 -ifdef(TEST).
 

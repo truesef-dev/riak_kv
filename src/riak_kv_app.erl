@@ -53,7 +53,7 @@ start(_Type, _StartArgs) ->
        {old_vclock, 86400},
        {young_vclock, 20},
        {big_vclock, 50},
-       {small_vclock, 10},
+       {small_vclock, 50},
        {pr, 0},
        {r, quorum},
        {w, quorum},
@@ -85,8 +85,14 @@ start(_Type, _StartArgs) ->
             %% Go ahead and mark the riak_kv service as up in the node watcher.
             %% The riak_core_ring_handler blocks until all vnodes have been started
             %% synchronously.
-            riak_core:register_vnode_module(riak_kv_vnode),
-            riak_core_node_watcher:service_up(riak_kv, self()),
+            riak_core:register(riak_kv, [
+                {vnode_module, riak_kv_vnode},
+                {bucket_validator, riak_kv_bucket}
+            ]),
+
+            %% Add routes to webmachine
+            [ webmachine_router:add_route(R)
+              || R <- lists:reverse(riak_kv_web:dispatch_table()) ],
             {ok, Pid};
         {error, Reason} ->
             {error, Reason}

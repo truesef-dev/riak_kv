@@ -47,23 +47,23 @@
 %%</dd><dt> vnode_index_reads
 %%</dt><dd> The number of index reads handled by all vnodes on this node.
 %%          Each query counts as an index read.
-%%</dd><dd> update(index_reads)
+%%</dd><dd> update(vnode_index_read)
 %%
 %%</dd><dt> vnode_index_writes
 %%</dt><dd> The number of batched writes handled by all vnodes on this node.
-%%</dd><dd> update({index_writes, Postings})
+%%</dd><dd> update({vnode_index_write, PostingsAdded, PostingsRemoved})
 %%
 %%</dd><dt> vnode_index_writes_postings
 %%</dt><dd> The number of postings written to all vnodes on this node.
-%%</dd><dd> update({index_writes, Postings})
+%%</dd><dd> update({vnode_index_write, PostingsAdded, PostingsRemoved})
 %%
 %%</dd><dt> vnode_index_deletes
 %%</dt><dd> The number of batched writes handled by all vnodes on this node.
-%%</dd><dd> update({index_deletes, Postings})
+%%</dd><dd> update({vnode_index_delete, PostingsRemoved})
 %%
 %%</dd><dt> vnode_index_deletes_postings
 %%</dt><dd> The number of postings written to all vnodes on this node.
-%%</dd><dd> update({index_deletes, Postings})
+%%</dd><dd> update({vnode_index_delete, PostingsRemoved})
 %%
 %%</dd><dt> node_gets
 %%</dt><dd> Number of gets coordinated by this node in the last
@@ -199,7 +199,9 @@
                pbc_connects,pbc_connects_total,pbc_active,
                read_repairs, read_repairs_total,
                coord_redirs, coord_redirs_total, mapper_count, 
-               get_meter, put_meter, legacy}).
+               get_meter, put_meter,
+               precommit_fail, postcommit_fail,
+               legacy}).
 
 
 %% @spec start_link() -> {ok,Pid} | ignore | {error,Error}
@@ -278,6 +280,8 @@ v2_init() ->
                 mapper_count=0,
                 get_meter=make_meter(),
                 put_meter=make_meter(),
+                precommit_fail=0,
+                postcommit_fail=0,
                 legacy=false}}.
 -endif.
 
@@ -309,6 +313,8 @@ legacy_init() ->
                 read_repairs_total=0,
                 coord_redirs_total=0,
                 mapper_count=0,
+                precommit_fail=0,
+                postcommit_fail=0,
                 legacy=true}}.
 
 %% @private
@@ -368,9 +374,13 @@ update(vnode_put, Moment, State=#state{vnode_puts_total=VPT}) ->
     spiral_incr(#state.vnode_puts, Moment, State#state{vnode_puts_total=VPT+1});
 update(vnode_index_read, Moment, State=#state{vnode_index_reads_total=VPT}) ->
     spiral_incr(#state.vnode_index_reads, Moment, State#state{vnode_index_reads_total=VPT+1});
-update({vnode_index_write, Postings}, Moment, State=#state{vnode_index_writes_total=VIW, vnode_index_writes_postings_total=VIWP}) ->
-    NewState = spiral_incr(#state.vnode_index_writes, Moment, State#state{vnode_index_writes_total=VIW+1}),
-    spiral_incr(#state.vnode_index_writes_postings, Postings, Moment, NewState#state{vnode_index_writes_postings_total=VIWP+Postings});
+update({vnode_index_write, PostingsAdded, PostingsRemoved}, Moment, State=#state{vnode_index_writes_total=VIW, 
+                                                                                 vnode_index_writes_postings_total=VIWP,
+                                                                                 vnode_index_deletes_postings_total=VIDP}) ->
+    NewState1 = spiral_incr(#state.vnode_index_writes, Moment, State#state{vnode_index_writes_total=VIW+1}),
+    NewState2 = spiral_incr(#state.vnode_index_writes_postings, PostingsAdded, Moment, NewState1#state{vnode_index_writes_postings_total=VIWP+PostingsAdded}),
+    NewState3 = spiral_incr(#state.vnode_index_deletes_postings, PostingsRemoved, Moment, NewState2#state{vnode_index_deletes_postings_total=VIDP+PostingsRemoved}),
+    NewState3;
 update({vnode_index_delete, Postings}, Moment, State=#state{vnode_index_deletes_total=VID, vnode_index_deletes_postings_total=VIDP}) ->
     NewState = spiral_incr(#state.vnode_index_deletes, Moment, State#state{vnode_index_deletes_total=VID+1}),
     spiral_incr(#state.vnode_index_deletes_postings, Postings, Moment, NewState#state{vnode_index_deletes_postings_total=VIDP+Postings});
@@ -402,6 +412,10 @@ update(mapper_start, _Moment, State=#state{mapper_count=Count0}) ->
     State#state{mapper_count=Count0 + 1};
 update(mapper_end, _Moment, State=#state{mapper_count=Count0}) ->
     State#state{mapper_count=decrzero(Count0)};
+update(precommit_fail, _Moment, State=#state{precommit_fail=Count0}) ->
+    State#state{precommit_fail=Count0+1};
+update(postcommit_fail, _Moment, State=#state{postcommit_fail=Count0}) ->
+    State#state{postcommit_fail=Count0+1};
 update(_, _, State) ->
     State.
 
@@ -428,14 +442,15 @@ update1(vnode_put, _, State) ->
     update_metric(#state.vnode_puts, 1, State);
 update1(vnode_index_read, _, State) -> 
     update_metric(#state.vnode_index_reads, 1, State);
-update1({vnode_index_write, Postings}, _, State) ->
-    update_metric(#state.vnode_index_writes_postings,
-                  Postings, 
-                  update_metric(#state.vnode_index_writes, 1, State));
-update1({vnode_index_delete, Postings}, _, State) ->
-    update_metric(#state.vnode_index_deletes_postings,
-                  Postings, 
-                  update_metric(#state.vnode_index_deletes, 1, State));
+update1({vnode_index_write, PostingsAdded, PostingsRemoved}, _, State) ->
+    State1 = update_metric(#state.vnode_index_writes, 1, State),
+    State2 = update_metric(#state.vnode_index_writes_postings, PostingsAdded, State1),
+    State3 = update_metric(#state.vnode_index_deletes_postings, PostingsRemoved, State2),
+    State3;
+update1({vnode_index_delete, PostingsRemoved}, _, State) ->
+    State1 = update_metric(#state.vnode_index_deletes, 1, State),
+    State2 = update_metric(#state.vnode_index_deletes_postings, PostingsRemoved, State1),
+    State2;
 update1({get_fsm, _Bucket, Microsecs, _NumSiblings, _ObjSize}, Moment, State) ->
     update1({get_fsm_time, Microsecs}, Moment, State);
 update1({get_fsm_time, Microsecs}, _, State) ->
@@ -456,6 +471,10 @@ update1(mapper_start, _Moment, State=#state{mapper_count=Count0}) ->
     State#state{mapper_count=Count0+1};
 update1(mapper_end, _Moment, State=#state{mapper_count=Count0}) ->
     State#state{mapper_count=decrzero(Count0)};
+update1(precommit_fail, _Moment, State=#state{precommit_fail=Count0}) ->
+    State#state{precommit_fail=Count0+1};
+update1(postcommit_fail, _Moment, State=#state{postcommit_fail=Count0}) ->
+    State#state{postcommit_fail=Count0+1};
 update1(_, _, State) ->
     State.
 
@@ -588,6 +607,8 @@ node_stats(Moment, State=#state{node_gets_total=NGT,
                                 node_puts_total=NPT,
                                 read_repairs_total=RRT,
                                 coord_redirs_total=CRT,
+                                precommit_fail=PreF,
+                                postcommit_fail=PostF,
                                 legacy=true}) ->
     {Gets, GetMean, {GetMedian, GetNF, GetNN, GetH}} =
         slide_minute(Moment, #state.get_fsm_time, State, 0, 5000000, 20000, down),
@@ -622,7 +643,9 @@ node_stats(Moment, State=#state{node_gets_total=NGT,
      {node_get_fsm_objsize_99, ObjSizeNN},
      {node_get_fsm_objsize_100, ObjSizeH},
      {read_repairs_total, RRT},
-     {coord_redirs_total, CRT}];
+     {coord_redirs_total, CRT},
+     {precommit_fail, PreF},
+     {postcommit_fail, PostF}];
 node_stats(_, State=#state{legacy=false}) ->
     PutInfo = metric_stats(State#state.put_fsm_time),
     GetInfo = metric_stats(State#state.get_fsm_time),
@@ -630,6 +653,8 @@ node_stats(_, State=#state{legacy=false}) ->
     CRInfo =  metric_stats(State#state.coord_redirs),
     NodeGets = meter_minute(metric_stats(State#state.get_meter)),
     NodePuts = meter_minute(metric_stats(State#state.put_meter)),
+    PreF = State#state.precommit_fail,
+    PostF = State#state.postcommit_fail,
     [{node_gets, NodeGets},
      {node_gets_total, proplists:get_value(count, GetInfo)},
      {node_get_fsm_time_mean, proplists:get_value(mean, GetInfo)},
@@ -645,7 +670,9 @@ node_stats(_, State=#state{legacy=false}) ->
      {node_put_fsm_time_99, proplists:get_value(p99, PutInfo)},
      {node_put_fsm_time_100, proplists:get_value(max, PutInfo)},
      {read_repairs_total, proplists:get_value(count, RRInfo)},
-     {coord_redirs_total, proplists:get_value(count, CRInfo)}].
+     {coord_redirs_total, proplists:get_value(count, CRInfo)},
+     {precommit_fail, PreF},
+     {postcommit_fail, PostF}].
 
 
 %% @spec cpu_stats() -> proplist()

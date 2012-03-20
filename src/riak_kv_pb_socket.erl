@@ -46,7 +46,8 @@
 -record(pipe_ctx, {pipe,     % pipe handling mapred request
                    ref,      % easier-access ref/reqid
                    timer,    % ref() for timeout send_after
-                   sender}). % {pid(), monitor()} of process sending inputs
+                   sender,   % {pid(), monitor()} of process sending inputs
+                   has_mr_query}). % true if the request contains a query.
 
 -define(PROTO_MAJOR, 1).
 -define(PROTO_MINOR, 0).
@@ -101,8 +102,14 @@ handle_info({ReqId, done},
     NewState = send_msg(#rpblistkeysresp{done = 1}, State),
     inet:setopts(Socket, [{active, once}]),
     {noreply, NewState#state{req = undefined, req_ctx = undefined}};
+handle_info({ReqId, From, {keys, []}}, State=#state{req=#rpblistkeysreq{}, req_ctx=ReqId}) ->
+    riak_kv_keys_fsm:ack_keys(From),
+    {noreply, State}; % No keys - no need to send a message, will send done soon.
 handle_info({ReqId, {keys, []}}, State=#state{req=#rpblistkeysreq{}, req_ctx=ReqId}) ->
     {noreply, State}; % No keys - no need to send a message, will send done soon.
+handle_info({ReqId, From, {keys, Keys}}, State=#state{req=#rpblistkeysreq{}, req_ctx=ReqId}) ->
+    riak_kv_keys_fsm:ack_keys(From),
+    {noreply, send_msg(#rpblistkeysresp{keys = Keys}, State)};
 handle_info({ReqId, {keys, Keys}}, State=#state{req=#rpblistkeysreq{}, req_ctx=ReqId}) ->
     {noreply, send_msg(#rpblistkeysresp{keys = Keys}, State)};
 handle_info({ReqId, Error},
@@ -122,8 +129,8 @@ handle_info(#pipe_eoi{ref=ReqId},
 
 handle_info(#pipe_result{ref=ReqId, from=PhaseId, result=Res},
             State=#state{req=#rpbmapredreq{content_type = ContentType}, 
-                         req_ctx=#pipe_ctx{ref=ReqId}=PipeCtx}) ->
-    case encode_mapred_phase([Res], ContentType) of
+                         req_ctx=#pipe_ctx{ref=ReqId, has_mr_query=HasMRQuery}=PipeCtx}) ->
+    case encode_mapred_phase([Res], ContentType, HasMRQuery) of
         {error, Reason} ->
             erlang:cancel_timer(PipeCtx#pipe_ctx.timer),
             %% destroying the pipe will automatically kill the sender
@@ -134,15 +141,17 @@ handle_info(#pipe_result{ref=ReqId, from=PhaseId, result=Res},
             {noreply, send_msg(#rpbmapredresp{phase=PhaseId, 
                                               response=Response}, State)}
     end;
-handle_info(#pipe_log{ref=ReqId, msg=Msg},
+handle_info(#pipe_log{ref=ReqId, from=From, msg=Msg},
             State=#state{req=#rpbmapredreq{},
                          req_ctx=#pipe_ctx{ref=ReqId}=PipeCtx}) ->
     case Msg of
-        {trace, [error], {error, {Error, _Input}}} ->
+        {trace, [error], {error, Info}} ->
             erlang:cancel_timer(PipeCtx#pipe_ctx.timer),
             %% destroying the pipe will automatically kill the sender
             riak_pipe:destroy(PipeCtx#pipe_ctx.pipe),
-            NewState = send_error("~p", [{error, Error}], State),
+            JsonInfo = {struct, riak_kv_mapred_json:jsonify_pipe_error(
+                                  From, Info)},
+            NewState = send_error(mochijson2:encode(JsonInfo), [], State),
             {noreply, NewState#state{req = undefined, req_ctx = undefined}};
         _ ->
             {noreply, State}
@@ -192,7 +201,7 @@ handle_info({flow_results, PhaseId, ReqId, Res},
             State=#state{sock=Socket,
                          req=#rpbmapredreq{content_type = ContentType}, 
                          req_ctx=ReqId}) ->
-    case encode_mapred_phase(Res, ContentType) of
+    case encode_mapred_phase(Res, ContentType, true) of
         {error, Reason} ->
             NewState = send_error("~p", [Reason], State),
             inet:setopts(Socket, [{active, once}]),
@@ -441,8 +450,12 @@ process_message(#rpbgetbucketreq{bucket=B},
 process_message(#rpbsetbucketreq{bucket=B, props = PbProps}, 
                 #state{client=C} = State) ->
     Props = riakc_pb:erlify_rpbbucketprops(PbProps),
-    ok = C:set_bucket(B, Props),
-    send_msg(rpbsetbucketresp, State);
+    case C:set_bucket(B, Props) of
+        ok ->
+            send_msg(rpbsetbucketresp, State);
+        {error, Details} ->
+            send_error("Invalid bucket properties: ~p", [Details], State)
+    end;
 
 %% TODO: refactor, cleanup
 %% Start map/reduce job - results will be processed in handle_info
@@ -472,7 +485,8 @@ pipe_mapreduce(Req, State, Inputs, Query, Timeout) ->
             Ctx = #pipe_ctx{pipe=Pipe,
                             ref=PipeRef,
                             timer=Timer,
-                            sender={InputSender, SenderMonitor}},
+                            sender={InputSender, SenderMonitor},
+                            has_mr_query = (Query /= [])},
             State#state{req=Req, req_ctx=Ctx}
     catch throw:{badarg, Fitting, Reason} ->
             send_error("Phase ~p: ~s", [Fitting, Reason], State),
@@ -609,11 +623,12 @@ is_key_filter(_) ->
     false.
 
 %% Convert a map/reduce phase to the encoding requested
-encode_mapred_phase(Res, <<"application/json">>) ->
-    mochijson2:encode(Res);
-encode_mapred_phase(Res, <<"application/x-erlang-binary">>) ->
+encode_mapred_phase(Res, <<"application/json">>, HasMRQuery) ->
+    Res1 = riak_kv_mapred_json:jsonify_bkeys(Res, HasMRQuery),
+    mochijson2:encode(Res1);
+encode_mapred_phase(Res, <<"application/x-erlang-binary">>, _) ->
     term_to_binary(Res);
-encode_mapred_phase(_Res, ContentType) ->
+encode_mapred_phase(_Res, ContentType, _) ->
     {error, {unknown_content_type, ContentType}}.
 
 normalize_rw_value(?RIAKC_RW_ONE) -> one;

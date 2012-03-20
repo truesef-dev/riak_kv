@@ -82,7 +82,6 @@ process_post(RD, State) ->
             legacy_mapred(RD, State)
     end.
 
-
 %% Internal functions
 send_error(Error, RD)  ->
     wrq:set_resp_body(format_error(Error), RD).
@@ -177,8 +176,10 @@ pipe_mapred_nonchunked(RD, State, Pipe, NumKeeps, Sender) ->
                           || PR <- PhaseResults]
                          || PhaseResults <- Results]
                 end,
+            HasMRQuery = State#state.mrquery /= [],
+            JSONResults1 = riak_kv_mapred_json:jsonify_bkeys(JSONResults, HasMRQuery),
             {true,
-             wrq:set_resp_body(mochijson2:encode(JSONResults), RD),
+             wrq:set_resp_body(mochijson2:encode(JSONResults1), RD),
              State};
         {error, {sender_error, Error}} ->
             %% the sender links to the builder, so the builder has
@@ -190,8 +191,7 @@ pipe_mapred_nonchunked(RD, State, Pipe, NumKeeps, Sender) ->
             riak_pipe:destroy(Pipe),
             prevent_keepalive(),
             {{halt, 500}, send_error({error, timeout}, RD), State};
-        {error, {Error, _Input}} ->
-            %% TODO: jsonify Input for error message
+        {error, Error} ->
             riak_pipe:destroy(Pipe),
             prevent_keepalive(),
             {{halt, 500}, send_error({error, Error}, RD), State}
@@ -219,10 +219,11 @@ pipe_receive_output(Ref, {SenderPid, SenderRef}) ->
             eoi;
         #pipe_result{ref=Ref, from=From, result=Result} ->
             {ok, {From, Result}};
-        #pipe_log{ref=Ref, msg=Msg} ->
+        #pipe_log{ref=Ref, from=From, msg=Msg} ->
             case Msg of
-                {trace, [error], {error, {Error, Input}}} ->
-                    {error, {Error, Input}};
+                {trace, [error], {error, Info}} ->
+                    {error, riak_kv_mapred_json:jsonify_pipe_error(
+                              From, Info)};
                 _ ->
                     %% not a log message we're interested in
                     pipe_receive_output(Ref, {SenderPid, SenderRef})
@@ -259,9 +260,11 @@ pipe_stream_mapred_results(RD, Pipe,
             %% results come out of pipe one
             %% at a time but they're supposed to
             %% be in a list at the client end
-            JSONResult = [riak_kv_mapred_json:jsonify_not_found(Result)],
+            JSONResults = [riak_kv_mapred_json:jsonify_not_found(Result)],
+            HasMRQuery = State#state.mrquery /= [],
+            JSONResults1 = riak_kv_mapred_json:jsonify_bkeys(JSONResults, HasMRQuery),
             Data = mochijson2:encode({struct, [{phase, PhaseId},
-                                               {data, JSONResult}]}),
+                                               {data, JSONResults1}]}),
             Body = ["\r\n--", Boundary, "\r\n",
                     "Content-Type: application/json\r\n\r\n",
                     Data],
@@ -375,4 +378,3 @@ legacy_stream_mapred_results(RD, ReqId, #state{timeout=Timeout}=State) ->
     after FinalTimeout ->
             {format_error({error, timeout}), done}
     end.
-
